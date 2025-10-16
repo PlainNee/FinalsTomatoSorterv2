@@ -1,0 +1,263 @@
+#include <U8g2lib.h>
+
+// Pin Definitions
+#define BUTTON_UP 18
+#define BUTTON_DOWN 19
+#define BUTTON_SELECT 5
+
+// OLED Display
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// Menu States
+enum MenuState {
+  MAIN_MENU,
+  STATISTICS_MENU,
+  CHECK_STATISTICS,
+  RESET_STATISTICS,
+  SORTING_SCREEN
+};
+
+MenuState currentState = MAIN_MENU;
+int menuIndex = 0;
+
+// Statistics counters
+int countRed = 0;
+int countOrange = 0;
+int countGreen = 0;
+
+// Button debouncing
+unsigned long lastDebounceTime = 0;
+const long debounceInterval = 200;
+
+// Reset screen timing
+unsigned long resetDisplayTime = 0;
+bool showingResetMessage = false;
+
+// IP Address placeholder
+String ipAddress = "192.168.4.1";
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize buttons
+  pinMode(BUTTON_UP, INPUT_PULLUP);
+  pinMode(BUTTON_DOWN, INPUT_PULLUP);
+  pinMode(BUTTON_SELECT, INPUT_PULLUP);
+  
+  // Initialize OLED
+  u8g2.begin();
+  
+  // Show main menu
+  displayMainMenu();
+  
+  Serial.println("Menu System Ready");
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  // Handle reset message timeout
+  if (showingResetMessage && (currentMillis - resetDisplayTime >= 2000)) {
+    showingResetMessage = false;
+    currentState = STATISTICS_MENU;
+    menuIndex = 0;
+    displayStatisticsMenu();
+  }
+  
+  // Handle button presses based on current state
+  if (!showingResetMessage) {
+    switch (currentState) {
+      case MAIN_MENU:
+        handleMainMenu(currentMillis);
+        break;
+        
+      case STATISTICS_MENU:
+        handleStatisticsMenu(currentMillis);
+        break;
+        
+      case CHECK_STATISTICS:
+        handleCheckStatistics(currentMillis);
+        break;
+        
+      case SORTING_SCREEN:
+        handleSortingScreen(currentMillis);
+        break;
+    }
+  }
+}
+
+// ==================== MAIN MENU ====================
+void displayMainMenu() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB10_tr);
+  u8g2.drawStr(5, 15, "Tomato Sorter");
+  
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  
+  // Start Sorting option
+  if (menuIndex == 0) {
+    u8g2.drawStr(5, 35, "> Start Sorting");
+    u8g2.drawStr(5, 50, "  Statistics");
+  } else {
+    u8g2.drawStr(5, 35, "  Start Sorting");
+    u8g2.drawStr(5, 50, "> Statistics");
+  }
+  
+  u8g2.sendBuffer();
+}
+
+void handleMainMenu(unsigned long currentMillis) {
+  if (checkButtonPress(BUTTON_UP, currentMillis)) {
+    menuIndex = (menuIndex - 1 + 2) % 2;
+    displayMainMenu();
+  }
+  
+  if (checkButtonPress(BUTTON_DOWN, currentMillis)) {
+    menuIndex = (menuIndex + 1) % 2;
+    displayMainMenu();
+  }
+  
+  if (checkButtonPress(BUTTON_SELECT, currentMillis)) {
+    if (menuIndex == 0) {
+      // Go to Sorting Screen
+      currentState = SORTING_SCREEN;
+      displaySortingScreen();
+    } else {
+      // Go to Statistics Menu
+      currentState = STATISTICS_MENU;
+      menuIndex = 0;
+      displayStatisticsMenu();
+    }
+  }
+}
+
+// ==================== STATISTICS MENU ====================
+void displayStatisticsMenu() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB10_tr);
+  u8g2.drawStr(5, 15, "Statistics");
+  
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  
+  const char* options[] = {"> Check Statistics", "  Reset", "  Back to Menu"};
+  const char* optionsUnselected[] = {"  Check Statistics", "  Reset", "  Back to Menu"};
+  
+  for (int i = 0; i < 3; i++) {
+    if (i == menuIndex) {
+      u8g2.drawStr(5, 30 + (i * 12), options[i]);
+    } else {
+      u8g2.drawStr(5, 30 + (i * 12), optionsUnselected[i]);
+    }
+  }
+  
+  u8g2.sendBuffer();
+}
+
+void handleStatisticsMenu(unsigned long currentMillis) {
+  if (checkButtonPress(BUTTON_UP, currentMillis)) {
+    menuIndex = (menuIndex - 1 + 3) % 3;
+    displayStatisticsMenu();
+  }
+  
+  if (checkButtonPress(BUTTON_DOWN, currentMillis)) {
+    menuIndex = (menuIndex + 1) % 3;
+    displayStatisticsMenu();
+  }
+  
+  if (checkButtonPress(BUTTON_SELECT, currentMillis)) {
+    if (menuIndex == 0) {
+      // Check Statistics
+      currentState = CHECK_STATISTICS;
+      displayCheckStatistics();
+    } else if (menuIndex == 1) {
+      // Reset
+      countRed = 0;
+      countOrange = 0;
+      countGreen = 0;
+      currentState = RESET_STATISTICS;
+      displayResetMessage();
+    } else {
+      // Back to Menu
+      currentState = MAIN_MENU;
+      menuIndex = 0;
+      displayMainMenu();
+    }
+  }
+}
+
+// ==================== CHECK STATISTICS ====================
+void displayCheckStatistics() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  
+  u8g2.drawStr(5, 12, ("Red: " + String(countRed)).c_str());
+  u8g2.drawStr(5, 27, ("Orange: " + String(countOrange)).c_str());
+  u8g2.drawStr(5, 42, ("Green: " + String(countGreen)).c_str());
+  
+  u8g2.setFont(u8g2_font_5x7_tr);
+  u8g2.drawStr(5, 58, "Press any button to return");
+  
+  u8g2.sendBuffer();
+}
+
+void handleCheckStatistics(unsigned long currentMillis) {
+  if (checkButtonPress(BUTTON_UP, currentMillis) || 
+      checkButtonPress(BUTTON_DOWN, currentMillis) || 
+      checkButtonPress(BUTTON_SELECT, currentMillis)) {
+    currentState = STATISTICS_MENU;
+    menuIndex = 0;
+    displayStatisticsMenu();
+  }
+}
+
+// ==================== RESET STATISTICS ====================
+void displayResetMessage() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  
+  u8g2.drawStr(10, 30, "Statistics has");
+  u8g2.drawStr(10, 45, "been reset!");
+  
+  u8g2.sendBuffer();
+  
+  showingResetMessage = true;
+  resetDisplayTime = millis();
+}
+
+// ==================== SORTING SCREEN ====================
+void displaySortingScreen() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  
+  u8g2.drawStr(5, 15, "Sorting....");
+  u8g2.drawStr(5, 30, "IP Address:");
+  u8g2.drawStr(5, 45, ipAddress.c_str());
+  
+  u8g2.setFont(u8g2_font_5x7_tr);
+  u8g2.drawStr(5, 58, "Press any button to return");
+  
+  u8g2.sendBuffer();
+}
+
+void handleSortingScreen(unsigned long currentMillis) {
+  if (checkButtonPress(BUTTON_UP, currentMillis) || 
+      checkButtonPress(BUTTON_DOWN, currentMillis) || 
+      checkButtonPress(BUTTON_SELECT, currentMillis)) {
+    currentState = MAIN_MENU;
+    menuIndex = 0;
+    displayMainMenu();
+  }
+}
+
+// ==================== UTILITY FUNCTIONS ====================
+bool checkButtonPress(int button, unsigned long currentMillis) {
+  if (digitalRead(button) == LOW) {
+    if (currentMillis - lastDebounceTime >= debounceInterval) {
+      lastDebounceTime = currentMillis;
+      Serial.print("Button pressed: ");
+      Serial.println(button);
+      return true;
+    }
+  }
+  return false;
+}
