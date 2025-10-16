@@ -173,16 +173,19 @@ void handleUnstuck() {
 }
 
 void handleResetStats() {
-  if (!isSorting) {
+  if (!isSorting && !showingResetMessage) {
     countRed = 0;
     countOrange = 0;
     countGreen = 0;
     
     // Show reset message on OLED
+    currentState = RESET_STATISTICS;
     displayResetMessage();
     
     Serial.println("Statistics reset via web");
     server.send(200, "text/plain", "OK");
+  } else if (showingResetMessage) {
+    server.send(400, "text/plain", "Please wait, reset in progress");
   } else {
     server.send(400, "text/plain", "Cannot reset while sorting");
   }
