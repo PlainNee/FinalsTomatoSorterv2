@@ -78,15 +78,9 @@ void loop() {
   // Handle reset message timeout
   if (showingResetMessage && (currentMillis - resetDisplayTime >= 2000)) {
     showingResetMessage = false;
-    // Return to appropriate state based on where reset was triggered
-    if (isSorting) {
-      currentState = SORTING_SCREEN;
-      displaySortingScreen();
-    } else {
-      currentState = STATISTICS_MENU;
-      menuIndex = 0;
-      displayStatisticsMenu();
-    }
+    currentState = STATISTICS_MENU;
+    menuIndex = 0;
+    displayStatisticsMenu();
   }
   
   // Handle button presses based on current state
