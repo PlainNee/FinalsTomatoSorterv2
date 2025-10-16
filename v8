@@ -1,0 +1,859 @@
+#include <U8g2lib.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// Color Sensor Pin Definitions
+#define S0 25
+#define S1 26
+#define S2 33
+#define S3 32
+#define sensorOut 34
+
+// Button Pin Definitions
+#define BUTTON_UP 18
+#define BUTTON_DOWN 19
+#define BUTTON_SELECT 5
+
+// OLED Display
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// WiFi AP Configuration
+const char* ssid = "Tomato_Sorter";
+const char* password = "tomato123";
+WebServer server(80);
+
+// Menu States
+enum MenuState {
+  MAIN_MENU,
+  STATISTICS_MENU,
+  CHECK_STATISTICS,
+  RESET_STATISTICS,
+  SORTING_SCREEN
+};
+
+MenuState currentState = MAIN_MENU;
+int menuIndex = 0;
+
+// Statistics counters
+int countRed = 0;
+int countOrange = 0;
+int countGreen = 0;
+
+// Sorting state
+bool isSorting = false;
+
+// Button debouncing
+unsigned long lastDebounceTime = 0;
+const long debounceInterval = 200;
+
+// Reset screen timing
+unsigned long resetDisplayTime = 0;
+bool showingResetMessage = false;
+
+// UI disable flag (exposed to web clients)
+bool uiDisabled = false;
+
+// IP Address
+String ipAddress = "";
+
+// Color detection timing
+unsigned long previousColorCheck = 0;
+const long colorCheckInterval = 500;
+
+// Color detection lock
+bool detectionLock = false;
+unsigned long cooldownStartTime = 0;
+const long cooldownDuration = 1000;
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize buttons
+  pinMode(BUTTON_UP, INPUT_PULLUP);
+  pinMode(BUTTON_DOWN, INPUT_PULLUP);
+  pinMode(BUTTON_SELECT, INPUT_PULLUP);
+
+  // Initialize color sensor
+  pinMode(S0, OUTPUT);
+  pinMode(S1, OUTPUT);
+  pinMode(S2, OUTPUT);
+  pinMode(S3, OUTPUT);
+  pinMode(sensorOut, INPUT);
+  digitalWrite(S0, HIGH);
+  digitalWrite(S1, LOW);
+
+  // Initialize OLED
+  u8g2.begin();
+
+  // Setup WiFi Access Point
+  setupWiFiAP();
+
+  // Setup web server routes
+  setupWebServer();
+
+  // Show main menu
+  displayMainMenu();
+
+  Serial.println("Menu System Ready");
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Handle web server
+  server.handleClient();
+
+  // Handle reset message timeout
+  if (showingResetMessage && (currentMillis - resetDisplayTime >= 2000)) {
+    showingResetMessage = false;
+    uiDisabled = false;
+    currentState = STATISTICS_MENU;
+    menuIndex = 0;
+    displayStatisticsMenu();
+  }
+
+  // Handle color detection during sorting
+  if (isSorting && !detectionLock && (currentMillis - previousColorCheck >= colorCheckInterval)) {
+    previousColorCheck = currentMillis;
+    checkAndDetectColor();
+  }
+
+  // Handle cooldown release
+  if (detectionLock && (currentMillis - cooldownStartTime >= cooldownDuration)) {
+    detectionLock = false;
+    Serial.println("Detection lock released");
+  }
+
+  // Handle button presses based on current state (disabled while showing reset message)
+  if (!showingResetMessage) {
+    switch (currentState) {
+      case MAIN_MENU:
+        handleMainMenu(currentMillis);
+        break;
+
+      case STATISTICS_MENU:
+        handleStatisticsMenu(currentMillis);
+        break;
+
+      case CHECK_STATISTICS:
+        handleCheckStatistics(currentMillis);
+        break;
+
+      case SORTING_SCREEN:
+        handleSortingScreen(currentMillis);
+        break;
+    }
+  }
+}
+
+// ==================== COLOR DETECTION ====================
+int getColorFrequency(int s2State, int s3State) {
+  digitalWrite(S2, s2State);
+  digitalWrite(S3, s3State);
+  delay(80);
+  return pulseIn(sensorOut, LOW, 50000);
+}
+
+String detectColor(int red, int green, int blue) {
+  int total = red + green + blue;
+  if (total == 0) return "Unknown";
+
+  float r = red / (float)total;
+  float g = green / (float)total;
+  float b = blue / (float)total;
+
+  Serial.printf("Normalized: R=%.3f, G=%.3f, B=%.3f\n", r, g, b);
+
+  // Calculate ratios to help distinguish colors
+  float rg_ratio = r / g;
+  float bg_ratio = b / g;
+  float rb_ratio = r / b;
+
+  // Green detection - based on your green data patterns
+  if (rg_ratio >= 0.80f && rg_ratio <= 0.92f &&
+      bg_ratio >= 0.88f && bg_ratio <= 0.96f) {
+    return "Green";
+  }
+
+  // Orange detection - based on your orange data patterns  
+  if (rg_ratio >= 0.68f && rg_ratio <= 0.78f &&
+      bg_ratio >= 0.82f && bg_ratio <= 0.92f) {
+    return "Orange";
+  }
+
+  // Red detection - based on your red data patterns
+  if (rg_ratio >= 0.62f && rg_ratio <= 0.72f &&
+      bg_ratio >= 0.75f && bg_ratio <= 0.85f) {
+    return "Red";
+  }
+
+  return "Unknown";
+}
+
+void checkAndDetectColor() {
+  int redFreq = getColorFrequency(LOW, LOW);
+  int greenFreq = getColorFrequency(HIGH, HIGH);
+  int blueFreq = getColorFrequency(LOW, HIGH);
+
+  // Enhanced no-object detection with frequency thresholds
+  if (redFreq > 1500 && greenFreq > 1500 && blueFreq > 1500) {
+    // No object present - display "Unknown"
+    displaySortingScreenWithColor("Unknown");
+    return;
+  }
+
+  // Additional check: if all frequencies are very similar and high, likely no object
+  int maxFreq = max(redFreq, max(greenFreq, blueFreq));
+  int minFreq = min(redFreq, min(greenFreq, blueFreq));
+  if (maxFreq - minFreq < 100 && maxFreq > 1000) {
+    // Likely no object or uniform background - display "Unknown"
+    displaySortingScreenWithColor("Unknown");
+    return;
+  }
+
+  String color = detectColor(redFreq, greenFreq, blueFreq);
+
+  if (color != "Unknown") {
+    // Lock detection to prevent multiple counts
+    detectionLock = true;
+    cooldownStartTime = millis();
+
+    // Update statistics
+    if (color == "Red") {
+      countRed++;
+      Serial.println("Red tomato detected and counted!");
+    } else if (color == "Orange") {
+      countOrange++;
+      Serial.println("Orange tomato detected and counted!");
+    } else if (color == "Green") {
+      countGreen++;
+      Serial.println("Green tomato detected and counted!");
+    }
+  }
+
+  // Always update the display with the detected color (even if "Unknown")
+  displaySortingScreenWithColor(color);
+}
+
+// ==================== WiFi SETUP ====================
+void setupWiFiAP() {
+  WiFi.softAP(ssid, password);
+  ipAddress = WiFi.softAPIP().toString();
+
+  Serial.println("Access Point Started");
+  Serial.print("SSID: ");
+  Serial.println(ssid);
+  Serial.print("IP Address: ");
+  Serial.println(ipAddress);
+}
+
+// ==================== WEB SERVER SETUP ====================
+void setupWebServer() {
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/start", handleStartSorting);
+  server.on("/stop", handleStopSorting);
+  server.on("/unstuck", handleUnstuck);
+  server.on("/reset", handleResetStats);
+
+  server.begin();
+  Serial.println("Web Server Started");
+}
+
+void handleRoot() {
+  String html = getHTML();
+  server.send(200, "text/html", html);
+}
+
+void handleStatus() {
+  String json = "{";
+  json += "\"isSorting\":" + String(isSorting ? "true" : "false") + ",";
+  json += "\"countRed\":" + String(countRed) + ",";
+  json += "\"countOrange\":" + String(countOrange) + ",";
+  json += "\"countGreen\":" + String(countGreen) + ",";
+  json += "\"disableUI\":" + String(showingResetMessage ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleStartSorting() {
+  isSorting = true;
+  currentState = SORTING_SCREEN;
+  displaySortingScreen();
+  server.send(200, "text/plain", "OK");
+  Serial.println("Sorting started via web");
+}
+
+void handleStopSorting() {
+  isSorting = false;
+  currentState = MAIN_MENU;
+  menuIndex = 0;
+  displayMainMenu();
+  server.send(200, "text/plain", "OK");
+  Serial.println("Sorting stopped via web");
+}
+
+void handleUnstuck() {
+  if (isSorting) {
+    // Release detection lock to allow new detection
+    detectionLock = false;
+    Serial.println("Unstuck command received - detection lock released");
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Cannot unstuck when not sorting");
+  }
+}
+
+void handleResetStats() {
+  // Reset can only happen when not sorting and not already showing reset message
+  if (!isSorting && !showingResetMessage) {
+    countRed = 0;
+    countOrange = 0;
+    countGreen = 0;
+
+    // Show reset message on OLED and set UI disabled flag
+    currentState = RESET_STATISTICS;
+    displayResetMessage();
+
+    // Set flags (displayResetMessage also sets showingResetMessage and resetDisplayTime)
+    uiDisabled = true;
+
+    Serial.println("Statistics reset via web");
+    server.send(200, "text/plain", "RESETTING");
+  } else if (showingResetMessage) {
+    server.send(400, "text/plain", "Please wait, reset in progress");
+  } else {
+    server.send(400, "text/plain", "Cannot reset while sorting");
+  }
+}
+
+// ==================== HTML GENERATION ====================
+String getHTML() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tomato Sorter</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: 'Courier New', monospace;
+      background: linear-gradient(135deg, #0a0a0a 0%, #1a0a2e 100%);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 20px;
+      color: #fff;
+    }
+
+    .container {
+      background: rgba(20, 20, 40, 0.8);
+      border: 3px solid #00ffff;
+      border-radius: 15px;
+      padding: 30px;
+      max-width: 500px;
+      width: 100%;
+      box-shadow: 0 0 30px rgba(0, 255, 255, 0.5),
+                  inset 0 0 30px rgba(0, 255, 255, 0.1);
+    }
+
+    h1 {
+      text-align: center;
+      color: #00ffff;
+      text-shadow: 0 0 20px #00ffff, 0 0 30px #00ffff;
+      font-size: 2em;
+      margin-bottom: 10px;
+      letter-spacing: 3px;
+    }
+
+    .status {
+      text-align: center;
+      color: #ff00ff;
+      font-size: 1.1em;
+      margin-bottom: 20px;
+      text-shadow: 0 0 10px #ff00ff;
+      min-height: 25px;
+    }
+
+    .buttons {
+      display: flex;
+      flex-direction: column;
+      gap: 15px;
+      margin-bottom: 30px;
+    }
+
+    button {
+      background: linear-gradient(135deg, #00ffff 0%, #0080ff 100%);
+      border: 2px solid #00ffff;
+      color: #000;
+      padding: 15px 25px;
+      font-size: 1.1em;
+      font-weight: bold;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: all 0.3s;
+      box-shadow: 0 0 15px rgba(0, 255, 255, 0.5);
+      font-family: 'Courier New', monospace;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    button:hover:not(:disabled) {
+      background: linear-gradient(135deg, #00ffff 0%, #00ccff 100%);
+      box-shadow: 0 0 25px rgba(0, 255, 255, 0.8);
+      transform: translateY(-2px);
+    }
+
+    button:active:not(:disabled) {
+      transform: translateY(0);
+    }
+
+    button:disabled {
+      background: linear-gradient(135deg, #333 0%, #555 100%);
+      border-color: #666;
+      color: #888;
+      cursor: not-allowed;
+      box-shadow: none;
+      opacity: 0.85;
+    }
+
+    button.stop {
+      background: linear-gradient(135deg, #ff00ff 0%, #ff0080 100%);
+      border-color: #ff00ff;
+      box-shadow: 0 0 15px rgba(255, 0, 255, 0.5);
+    }
+
+    button.stop:hover:not(:disabled) {
+      box-shadow: 0 0 25px rgba(255, 0, 255, 0.8);
+    }
+
+    button.unstuck {
+      background: linear-gradient(135deg, #ffff00 0%, #ffaa00 100%);
+      border-color: #ffff00;
+      box-shadow: 0 0 15px rgba(255, 255, 0, 0.5);
+    }
+
+    button.unstuck:hover:not(:disabled) {
+      box-shadow: 0 0 25px rgba(255, 255, 0, 0.8);
+    }
+
+    button.reset {
+      background: linear-gradient(135deg, #ff6600 0%, #ff3300 100%);
+      border-color: #ff6600;
+      box-shadow: 0 0 15px rgba(255, 102, 0, 0.5);
+    }
+
+    button.reset:hover:not(:disabled) {
+      box-shadow: 0 0 25px rgba(255, 102, 0, 0.8);
+    }
+
+    .stats {
+      background: rgba(0, 0, 0, 0.5);
+      border: 2px solid #00ff00;
+      border-radius: 10px;
+      padding: 20px;
+      box-shadow: 0 0 20px rgba(0, 255, 0, 0.3),
+                  inset 0 0 20px rgba(0, 255, 0, 0.1);
+    }
+
+    .stats h2 {
+      text-align: center;
+      color: #00ff00;
+      text-shadow: 0 0 15px #00ff00;
+      margin-bottom: 15px;
+      font-size: 1.5em;
+      letter-spacing: 2px;
+    }
+
+    .stat-item {
+      display: flex;
+      justify-content: space-between;
+      padding: 12px 15px;
+      margin: 8px 0;
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 8px;
+      border-left: 4px solid;
+      font-size: 1.1em;
+      transition: all 0.3s;
+    }
+
+    .stat-item:hover {
+      background: rgba(255, 255, 255, 0.05);
+      transform: translateX(5px);
+    }
+
+    .stat-item.red {
+      border-left-color: #ff0000;
+      color: #ff6666;
+    }
+
+    .stat-item.orange {
+      border-left-color: #ff8800;
+      color: #ffaa66;
+    }
+
+    .stat-item.green {
+      border-left-color: #00ff00;
+      color: #66ff66;
+    }
+
+    .stat-label {
+      font-weight: bold;
+      text-shadow: 0 0 10px currentColor;
+    }
+
+    .stat-value {
+      font-weight: bold;
+      font-size: 1.2em;
+      text-shadow: 0 0 15px currentColor;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.6; }
+    }
+
+    .sorting-active {
+      animation: pulse 2s infinite;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>TOMATO SORTER</h1>
+    <div class="status" id="statusText"></div>
+
+    <div class="buttons">
+      <button id="mainBtn" onclick="toggleSorting()"></button>
+      <button id="unstuckBtn" class="unstuck" onclick="unstuck()">Unstuck the sorter</button>
+      <button id="resetBtn" class="reset" onclick="resetStats()">Reset Statistics</button>
+    </div>
+
+    <div class="stats">
+      <h2>Tomato Count</h2>
+      <div class="stat-item red">
+        <span class="stat-label">Red Tomatoes:</span>
+        <span class="stat-value" id="redCount">0</span>
+      </div>
+      <div class="stat-item orange">
+        <span class="stat-label">Orange Tomatoes:</span>
+        <span class="stat-value" id="orangeCount">0</span>
+      </div>
+      <div class="stat-item green">
+        <span class="stat-label">Green Tomatoes:</span>
+        <span class="stat-value" id="greenCount">0</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let isSorting = false;
+
+    function disableAllButtons(disable) {
+      document.querySelectorAll('button').forEach(btn => {
+        btn.disabled = disable;
+      });
+    }
+
+    function updateUI() {
+      fetch('/status')
+        .then(response => response.json())
+        .then(data => {
+          isSorting = data.isSorting;
+
+          document.getElementById('redCount').textContent = data.countRed;
+          document.getElementById('orangeCount').textContent = data.countOrange;
+          document.getElementById('greenCount').textContent = data.countGreen;
+
+          const mainBtn = document.getElementById('mainBtn');
+          const unstuckBtn = document.getElementById('unstuckBtn');
+          const resetBtn = document.getElementById('resetBtn');
+          const statusText = document.getElementById('statusText');
+
+          if (data.disableUI) {
+            disableAllButtons(true);
+            statusText.textContent = '';
+            statusText.className = 'status';
+            return;
+          }
+
+          if (isSorting) {
+            mainBtn.textContent = 'Stop Sorting';
+            mainBtn.className = 'stop';
+            unstuckBtn.disabled = false;
+            resetBtn.disabled = true;
+            statusText.textContent = 'Sorting in progress....';
+            statusText.className = 'status sorting-active';
+          } else {
+            mainBtn.textContent = 'Start Sorting';
+            mainBtn.className = '';
+            unstuckBtn.disabled = true;
+            resetBtn.disabled = false;
+            statusText.textContent = '';
+            statusText.className = 'status';
+          }
+        })
+        .catch(error => console.error('Error:', error));
+    }
+
+    function toggleSorting() {
+      if (isSorting) {
+        fetch('/stop')
+          .then(() => updateUI())
+          .catch(error => console.error('Error:', error));
+      } else {
+        fetch('/start')
+          .then(() => updateUI())
+          .catch(error => console.error('Error:', error));
+      }
+    }
+
+    function unstuck() {
+      if (isSorting) {
+        fetch('/unstuck')
+          .then(response => {
+            if (response.ok) {
+              alert('Unstuck command sent!');
+            }
+          })
+          .catch(error => console.error('Error:', error));
+      }
+    }
+
+    function resetStats() {
+      if (!isSorting && confirm('Are you sure you want to reset all statistics?')) {
+        disableAllButtons(true);
+
+        fetch('/reset')
+          .then(response => {
+            if (!response.ok) {
+              disableAllButtons(false);
+              response.text().then(txt => alert('Reset failed: ' + txt));
+              return;
+            }
+            setTimeout(() => {
+              disableAllButtons(false);
+              updateUI();
+            }, 2000);
+          })
+          .catch(error => {
+            console.error('Error:', error);
+            disableAllButtons(false);
+          });
+      }
+    }
+
+    setInterval(updateUI, 500);
+    updateUI();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+  return html;
+}
+
+// ==================== MAIN MENU ====================
+void displayMainMenu() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB10_tr);
+  u8g2.drawStr(5, 15, "Tomato Sorter");
+
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+
+  if (menuIndex == 0) {
+    u8g2.drawStr(5, 35, "> Start Sorting");
+    u8g2.drawStr(5, 50, "  Statistics");
+  } else {
+    u8g2.drawStr(5, 35, "  Start Sorting");
+    u8g2.drawStr(5, 50, "> Statistics");
+  }
+
+  u8g2.sendBuffer();
+}
+
+void handleMainMenu(unsigned long currentMillis) {
+  if (checkButtonPress(BUTTON_UP, currentMillis)) {
+    menuIndex = (menuIndex - 1 + 2) % 2;
+    displayMainMenu();
+  }
+
+  if (checkButtonPress(BUTTON_DOWN, currentMillis)) {
+    menuIndex = (menuIndex + 1) % 2;
+    displayMainMenu();
+  }
+
+  if (checkButtonPress(BUTTON_SELECT, currentMillis)) {
+    if (menuIndex == 0) {
+      isSorting = true;
+      currentState = SORTING_SCREEN;
+      displaySortingScreen();
+    } else {
+      currentState = STATISTICS_MENU;
+      menuIndex = 0;
+      displayStatisticsMenu();
+    }
+  }
+}
+
+// ==================== STATISTICS MENU ====================
+void displayStatisticsMenu() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB10_tr);
+  u8g2.drawStr(5, 15, "Statistics");
+
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+
+  if (menuIndex == 0) {
+    u8g2.drawStr(5, 30, "> Check Statistics");
+  } else {
+    u8g2.drawStr(5, 30, "  Check Statistics");
+  }
+
+  if (menuIndex == 1) {
+    u8g2.drawStr(5, 42, "> Reset");
+  } else {
+    u8g2.drawStr(5, 42, "  Reset");
+  }
+
+  if (menuIndex == 2) {
+    u8g2.drawStr(5, 54, "> Back to Menu");
+  } else {
+    u8g2.drawStr(5, 54, "  Back to Menu");
+  }
+
+  u8g2.sendBuffer();
+}
+
+void handleStatisticsMenu(unsigned long currentMillis) {
+  if (checkButtonPress(BUTTON_UP, currentMillis)) {
+    menuIndex = (menuIndex - 1 + 3) % 3;
+    displayStatisticsMenu();
+  }
+
+  if (checkButtonPress(BUTTON_DOWN, currentMillis)) {
+    menuIndex = (menuIndex + 1) % 3;
+    displayStatisticsMenu();
+  }
+
+  if (checkButtonPress(BUTTON_SELECT, currentMillis)) {
+    if (menuIndex == 0) {
+      currentState = CHECK_STATISTICS;
+      displayCheckStatistics();
+    } else if (menuIndex == 1) {
+      if (!isSorting && !showingResetMessage) {
+        countRed = 0;
+        countOrange = 0;
+        countGreen = 0;
+        currentState = RESET_STATISTICS;
+        displayResetMessage();
+        uiDisabled = true;
+      }
+    } else {
+      currentState = MAIN_MENU;
+      menuIndex = 0;
+      displayMainMenu();
+    }
+  }
+}
+
+// ==================== CHECK STATISTICS ====================
+void displayCheckStatistics() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+
+  u8g2.drawStr(5, 12, ("Red: " + String(countRed)).c_str());
+  u8g2.drawStr(5, 27, ("Orange: " + String(countOrange)).c_str());
+  u8g2.drawStr(5, 42, ("Green: " + String(countGreen)).c_str());
+
+  u8g2.setFont(u8g2_font_5x7_tr);
+  u8g2.drawStr(5, 58, "Press a button to return");
+
+  u8g2.sendBuffer();
+}
+
+void handleCheckStatistics(unsigned long currentMillis) {
+  if (checkButtonPress(BUTTON_UP, currentMillis) || 
+      checkButtonPress(BUTTON_DOWN, currentMillis) || 
+      checkButtonPress(BUTTON_SELECT, currentMillis)) {
+    currentState = STATISTICS_MENU;
+    menuIndex = 0;
+    displayStatisticsMenu();
+  }
+}
+
+// ==================== RESET STATISTICS ====================
+void displayResetMessage() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+
+  u8g2.drawStr(10, 30, "Statistics has");
+  u8g2.drawStr(10, 45, "been reset!");
+
+  u8g2.sendBuffer();
+
+  showingResetMessage = true;
+  resetDisplayTime = millis();
+  uiDisabled = true;
+}
+
+// ==================== SORTING SCREEN ====================
+void displaySortingScreen() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+
+  u8g2.drawStr(5, 15, "Sorting....");
+  u8g2.drawStr(5, 30, "IP Address:");
+  u8g2.drawStr(5, 45, ipAddress.c_str());
+
+  u8g2.setFont(u8g2_font_5x7_tr);
+  u8g2.drawStr(5, 58, "Press a button to return");
+
+  u8g2.sendBuffer();
+}
+
+void displaySortingScreenWithColor(String color) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+
+  u8g2.drawStr(5, 15, "Sorting....");
+  u8g2.drawStr(5, 30, ("Detected: " + color).c_str());
+  u8g2.drawStr(5, 45, ipAddress.c_str());
+
+  u8g2.setFont(u8g2_font_5x7_tr);
+  u8g2.drawStr(5, 58, "Press a button to return");
+
+  u8g2.sendBuffer();
+}
+
+void handleSortingScreen(unsigned long currentMillis) {
+  if (checkButtonPress(BUTTON_UP, currentMillis) || 
+      checkButtonPress(BUTTON_DOWN, currentMillis) || 
+      checkButtonPress(BUTTON_SELECT, currentMillis)) {
+    isSorting = false;
+    currentState = MAIN_MENU;
+    menuIndex = 0;
+    displayMainMenu();
+  }
+}
+
+// ==================== UTILITY FUNCTIONS ====================
+bool checkButtonPress(int button, unsigned long currentMillis) {
+  if (digitalRead(button) == LOW) {
+    if (currentMillis - lastDebounceTime >= debounceInterval) {
+      lastDebounceTime = currentMillis;
+      Serial.print("Button pressed: ");
+      Serial.println(button);
+      return true;
+    }
+  }
+  return false;
+}
